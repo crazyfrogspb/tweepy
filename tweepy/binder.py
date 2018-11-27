@@ -4,24 +4,28 @@
 
 from __future__ import print_function
 
-import time
-import re
-
-from six.moves.urllib.parse import quote, urlencode
-import requests
-
 import logging
-
-from tweepy.error import TweepError, RateLimitError, is_rate_limit_error_message
-from tweepy.utils import convert_to_utf8_str
-from tweepy.models import Model
-import six
+import re
 import sys
+import time
 
+import requests
+import six
+from six.moves.urllib.parse import quote, urlencode
+
+from tweepy.error import (RateLimitError, TweepError,
+                          is_rate_limit_error_message)
+from tweepy.models import Model
+from tweepy.utils import convert_to_utf8_str
 
 re_path_template = re.compile('{\w+}')
 
 log = logging.getLogger('tweepy.binder')
+
+re_path_template = re.compile('{\w+}')
+path_category_pattern = re.compile('/([^/]+)/')
+path_without_ext_pattern = re.compile('(.*)\.\w{1,4}')
+
 
 def bind_api(**config):
 
@@ -53,6 +57,20 @@ def bind_api(**config):
                                           api.retry_delay)
             self.retry_errors = kwargs.pop('retry_errors',
                                            api.retry_errors)
+            self._remaining_calls = None
+
+            self.monitor_rate_limit = kwargs.pop(
+                'monitor_rate_limit', api.monitor_rate_limit)
+            if self.monitor_rate_limit:
+                self._path_category = path_category_pattern.findall(self.path)[
+                    0]
+                if self._path_category == 'application':
+                    self.monitor_rate_limit = False
+                self._path_without_ext = path_without_ext_pattern.findall(self.path)[
+                    0]
+                self._remaining_calls = [sys.maxsize] * len(self.api.auths)
+                self._reset_times = [sys.maxsize] * len(self.api.auths)
+
             self.wait_on_rate_limit = kwargs.pop('wait_on_rate_limit',
                                                  api.wait_on_rate_limit)
             self.wait_on_rate_limit_notify = kwargs.pop('wait_on_rate_limit_notify',
@@ -85,7 +103,6 @@ def bind_api(**config):
             # See Issue https://github.com/tweepy/tweepy/issues/12
             self.session.headers['Host'] = self.host
             # Monitoring rate limits
-            self._remaining_calls = None
             self._reset_time = None
 
         def build_parameters(self, args, kwargs):
@@ -94,7 +111,8 @@ def bind_api(**config):
                 if arg is None:
                     continue
                 try:
-                    self.session.params[self.allowed_param[idx]] = convert_to_utf8_str(arg)
+                    self.session.params[self.allowed_param[idx]
+                                        ] = convert_to_utf8_str(arg)
                 except IndexError:
                     raise TweepError('Too many parameters supplied!')
 
@@ -102,7 +120,8 @@ def bind_api(**config):
                 if arg is None:
                     continue
                 if k in self.session.params:
-                    raise TweepError('Multiple values for parameter %s supplied!' % k)
+                    raise TweepError(
+                        'Multiple values for parameter %s supplied!' % k)
 
                 self.session.params[k] = convert_to_utf8_str(arg)
 
@@ -119,10 +138,38 @@ def bind_api(**config):
                     try:
                         value = quote(self.session.params[name])
                     except KeyError:
-                        raise TweepError('No parameter value found for path variable: %s' % name)
+                        raise TweepError(
+                            'No parameter value found for path variable: %s' % name)
                     del self.session.params[name]
 
                 self.path = self.path.replace(variable, value)
+
+        @property
+        def remaining_calls(self):
+            """
+            Returns the number of remaining calls using the current api authentication.
+            """
+            result = self.api.rate_limit_status(
+            )['resources'][self._path_category][self._path_without_ext]['remaining']
+            if self.monitor_rate_limit:
+                self._remaining_calls[self.api.auth_idx] = result
+            return result
+
+        def switch_auth(self):
+            """ Switch authentication from the current one which is depleted """
+            if max(self._remaining_calls) > 0:
+                self.api.auth_idx = max(
+                    enumerate(self._remaining_calls), key=lambda x: x[1])[0]
+            else:
+                if not self.wait_on_rate_limit:
+                    raise TweepError('API calls depleted.')
+                next_idx = min(enumerate(self._reset_times),
+                               key=lambda x: x[1])[0]
+                sleep_time = self._reset_times[next_idx] - int(time.time())
+                if sleep_time > 0:
+                    time.sleep(sleep_time + 5)
+                self.api.auth_idx = next_idx
+            self.build_path()
 
         def execute(self):
             self.api.cached_result = False
@@ -134,7 +181,8 @@ def bind_api(**config):
             # Query the cache if one is available
             # and this request uses a GET method.
             if self.use_cache and self.api.cache and self.method == 'GET':
-                cache_result = self.api.cache.get('%s?%s' % (url, urlencode(self.session.params)))
+                cache_result = self.api.cache.get(
+                    '%s?%s' % (url, urlencode(self.session.params)))
                 # if cache result found and not expired, return it
                 if cache_result:
                     # must restore api reference
@@ -152,25 +200,6 @@ def bind_api(**config):
             # or maximum number of retries is reached.
             retries_performed = 0
             while retries_performed < self.retry_count + 1:
-                # handle running out of api calls
-                if self.wait_on_rate_limit:
-                    if self._reset_time is not None:
-                        if self._remaining_calls is not None:
-                            if self._remaining_calls < 1:
-                                sleep_time = self._reset_time - int(time.time())
-                                if sleep_time > 0:
-                                    if self.wait_on_rate_limit_notify:
-                                        log.warning("Rate limit reached. Sleeping for: %d" % sleep_time)
-                                    time.sleep(sleep_time + 5)  # sleep for few extra sec
-
-                # if self.wait_on_rate_limit and self._reset_time is not None and \
-                #                 self._remaining_calls is not None and self._remaining_calls < 1:
-                #     sleep_time = self._reset_time - int(time.time())
-                #     if sleep_time > 0:
-                #         if self.wait_on_rate_limit_notify:
-                #             log.warning("Rate limit reached. Sleeping for: %d" % sleep_time)
-                #         time.sleep(sleep_time + 5)  # sleep for few extra sec
-
                 # Apply authentication
                 auth = None
                 if self.api.auth:
@@ -189,21 +218,23 @@ def bind_api(**config):
                                                 auth=auth,
                                                 proxies=self.api.proxy)
                 except Exception as e:
-                    six.reraise(TweepError, TweepError('Failed to send request: %s' % e), sys.exc_info()[2])
+                    six.reraise(TweepError, TweepError(
+                        'Failed to send request: %s' % e), sys.exc_info()[2])
 
-                rem_calls = resp.headers.get('x-rate-limit-remaining')
+                if self.monitor_rate_limit:
+                    rem_calls = resp.headers.get('x-rate-limit-remaining')
+                    rem_calls = int(
+                        rem_calls) if rem_calls is not None else self._remaining_calls[self.api.auth_idx] - 1
+                    self._remaining_calls[self.api.auth_idx] = rem_calls
+                    reset_time = resp.headers.get('x-rate-limit-reset')
+                    if reset_time is not None:
+                        self._reset_times[self.api.auth_idx] = int(reset_time)
+                    if rem_calls == 0:
+                        log.warning("Rate limit reached. Switching to the next auth")
+                        self.switch_auth()
+                        if resp.status_code == 429:  # if ran out of calls before switching retry last call
+                            continue
 
-                if rem_calls is not None:
-                    self._remaining_calls = int(rem_calls)
-                elif isinstance(self._remaining_calls, int):
-                    self._remaining_calls -= 1
-                reset_time = resp.headers.get('x-rate-limit-reset')
-                if reset_time is not None:
-                    self._reset_time = int(reset_time)
-                if self.wait_on_rate_limit and self._remaining_calls == 0 and (
-                        # if ran out of calls before waiting switching retry last call
-                        resp.status_code == 429 or resp.status_code == 420):
-                    continue
                 retry_delay = self.retry_delay
                 # Exit request loop if non-retry error code
                 if resp.status_code == 200:
@@ -211,6 +242,9 @@ def bind_api(**config):
                 elif (resp.status_code == 429 or resp.status_code == 420) and self.wait_on_rate_limit:
                     if 'retry-after' in resp.headers:
                         retry_delay = float(resp.headers['retry-after'])
+                    if self.wait_on_rate_limit_notify:
+                        log.warning(
+                            "Rate limit reached. Sleeping for: %d" % retry_delay)
                 elif self.retry_errors and resp.status_code not in self.retry_errors:
                     break
 
@@ -238,7 +272,8 @@ def bind_api(**config):
 
             # Store result into cache if one is available.
             if self.use_cache and self.api.cache and self.method == 'GET' and result:
-                self.api.cache.store('%s?%s' % (url, urlencode(self.session.params)), result)
+                self.api.cache.store('%s?%s' % (
+                    url, urlencode(self.session.params)), result)
 
             return result
 
